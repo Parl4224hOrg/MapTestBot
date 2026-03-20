@@ -3,6 +3,7 @@ using MongoDB.Bson.Serialization.Attributes;
 
 namespace CLVR.SMM.MapTestBot.Models;
 
+[BsonIgnoreExtraElements]
 public sealed class ServerDocument
 {
     [BsonId]

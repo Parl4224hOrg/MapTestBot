@@ -3,6 +3,7 @@ using MongoDB.Bson.Serialization.Attributes;
 
 namespace CLVR.SMM.MapTestBot.Models;
 
+[BsonIgnoreExtraElements]
 public sealed class StatsDocument
 {
     [BsonId]
@@ -16,5 +17,5 @@ public sealed class StatsDocument
     public string QueueId { get; init; } = string.Empty;
 
     [BsonElement("mmr")]
-    public int Mmr { get; init; }
+    public decimal Mmr { get; init; }
 }

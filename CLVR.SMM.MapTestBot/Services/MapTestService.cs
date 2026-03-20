@@ -7,6 +7,7 @@ using MongoDB.Bson;
 using MongoDB.Driver;
 using PavlovRcon.Commands;
 using PavlovRcon.Config;
+using PavlovRcon.GameData;
 using PavlovRcon.RconClient;
 
 namespace CLVR.SMM.MapTestBot.Services;
@@ -45,13 +46,13 @@ public sealed class MapTestService : IMapTestService
             return new SwitchMapResult(false, "Map UGC is required.");
         }
 
-        var minimumUnixTimeMilliseconds = DateTimeOffset.UtcNow.Subtract(PlaytestWindow).ToUnixTimeMilliseconds();
+        var minimumUnixTimeSeconds = DateTimeOffset.UtcNow.Subtract(PlaytestWindow).ToUnixTimeSeconds();
 
         var playtest = await _mapTests.Find(mapTest =>
                 mapTest.Owner == discordId &&
                 !mapTest.Deleted &&
                 mapTest.ServerClaimed &&
-                mapTest.Time >= minimumUnixTimeMilliseconds)
+                mapTest.Time >= minimumUnixTimeSeconds)
             .SortByDescending(mapTest => mapTest.Time)
             .FirstOrDefaultAsync(cancellationToken);
 
@@ -60,59 +61,67 @@ public sealed class MapTestService : IMapTestService
             return new SwitchMapResult(false, "No active playtest owned by that Discord id was found in the past hour.");
         }
 
-        var server = await _servers.Find(server =>
-                server.Reserved &&
-                server.ReservedBy == discordId)
-            .FirstOrDefaultAsync(cancellationToken);
+        await using var server = await GetServer(playtest.Id);
 
         if (server is null)
         {
             return new SwitchMapResult(false, "No reserved server was found for that Discord id.");
         }
 
-        var connectionInfo = new RconConnectionInfo(server.Ip, server.Port, _pavlovRconOptions.Password);
-        var clientOptions = new RconClientOptions
-        {
-            CommandTimeout = TimeSpan.FromSeconds(_pavlovRconOptions.CommandTimeoutSeconds)
-        };
-
-        await using var client = new RconClient(connectionInfo, clientOptions);
-        var response = await client.SwitchMap(mapUgc.Trim(), null, cancellationToken);
-
+        await server.UpdateServerName("SMM Playtest", cancellationToken);
+        
+        var response = await server.SwitchMap(mapUgc.Trim(), GameMode.SearchAndDestroy, cancellationToken);
+        
         return response.SwitchMap
-            ? new SwitchMapResult(true, "Map switched successfully.", server.Id, server.Name)
-            : new SwitchMapResult(false, "Server rejected the map switch.", server.Id, server.Name);
+            ? new SwitchMapResult(true, "Map switched successfully.")
+            : new SwitchMapResult(false, "Server failed the map switch.");
     }
 
-    public async Task<AutoBalanceResult> AutoBalanceAsync(IReadOnlyCollection<string> memberDiscordIds, CancellationToken cancellationToken = default)
+    public async Task<AutoBalanceResult> AutoBalanceAsync(string testerId, CancellationToken cancellationToken = default)
     {
-        if (memberDiscordIds.Count != 10)
+        var minimumUnixTimeSeconds = DateTimeOffset.UtcNow.Subtract(PlaytestWindow).ToUnixTimeSeconds();
+        var playtest = await _mapTests.Find(mapTest =>
+                mapTest.Owner == testerId &&
+                !mapTest.Deleted &&
+                mapTest.ServerClaimed &&
+                mapTest.Time >= minimumUnixTimeSeconds)
+            .SortByDescending(mapTest => mapTest.Time)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (playtest is null)
         {
-            return AutoBalanceResult.Failed("Autobalance requires exactly 10 members.");
+            return new AutoBalanceResult(false, "No active playtest owned by that Discord id was found in the past hour.");
+        }
+        
+        await using var server = await GetServer(playtest.Id);
+
+        if (server is null)
+        {
+            return AutoBalanceResult.Failed("No server was found for the playtest.");
         }
 
-        var normalizedIds = memberDiscordIds
-            .Where(static id => !string.IsNullOrWhiteSpace(id))
-            .Select(static id => id.Trim())
-            .Distinct(StringComparer.Ordinal)
+        var onServer = await server.InspectAll();
+        
+        if (onServer.InspectList.Count != 10)
+        {
+            return AutoBalanceResult.Failed("Auto balance requires exactly 10 members.");
+        }
+
+        var userNames = onServer.InspectList
+            .Select(static player => player.UniqueId)
             .ToArray();
 
-        if (normalizedIds.Length != 10)
-        {
-            return AutoBalanceResult.Failed("Autobalance requires 10 unique Discord ids.");
-        }
-
-        var users = await _users.Find(user => normalizedIds.Contains(user.DiscordId))
+        var users = await _users.Find(user => userNames.Contains(user.OculusName))
             .ToListAsync(cancellationToken);
 
         if (users.Count != 10)
         {
-            return AutoBalanceResult.Failed("All 10 members must exist in the user database.");
+            var missingPlayers = userNames.Except(users.Select(user => user.OculusName));
+            return AutoBalanceResult.Failed("Not all users could be found: " + string.Join(", ", missingPlayers) + ".");
         }
 
         var userIds = users
-            .Select(user => ObjectId.Parse(user.MongoId))
-            .ToArray();
+            .Select(user => ObjectId.Parse(user.MongoId));
 
         var stats = await _stats.Find(stat =>
                 stat.QueueId == QueueId &&
@@ -131,27 +140,82 @@ public sealed class MapTestService : IMapTestService
                 return AutoBalanceResult.Failed("All 10 members must have SND MMR data.");
             }
 
-            players.Add(new BalancedPlayer(user.DiscordId, user.Name, stat.Mmr));
+            players.Add(new BalancedPlayer(user.DiscordId, user.OculusName, stat.Mmr));
         }
 
         var bestSplit = FindBestSplit(players);
-        return new AutoBalanceResult(
-            true,
-            "Teams generated successfully.",
-            bestSplit.TeamOne,
-            bestSplit.TeamTwo,
-            bestSplit.TeamOne.Sum(static player => player.Mmr),
-            bestSplit.TeamTwo.Sum(static player => player.Mmr));
+
+        
+        foreach (var player in bestSplit.TeamOne)
+        {
+            await server.SwitchTeam(player.Name, "0", cancellationToken);
+        }
+        
+        foreach (var player in bestSplit.TeamTwo)
+        {
+            await server.SwitchTeam(player.Name, "1", cancellationToken);
+        }
+        
+        return new AutoBalanceResult(true, "Auto balance completed successfully.");
+    }
+
+    public async Task<ResetServerResult> ResetServerAsync(string testerId, CancellationToken cancellationToken = default)
+    {
+        var minimumUnixTimeSeconds = DateTimeOffset.UtcNow.Subtract(PlaytestWindow).ToUnixTimeSeconds();
+        var playtest = await _mapTests.Find(mapTest =>
+                mapTest.Owner == testerId &&
+                !mapTest.Deleted &&
+                mapTest.ServerClaimed &&
+                mapTest.Time >= minimumUnixTimeSeconds)
+            .SortByDescending(mapTest => mapTest.Time)
+            .FirstOrDefaultAsync(cancellationToken);
+
+        if (playtest is null)
+        {
+            return new ResetServerResult(false, "No active playtest owned by that Discord id was found in the past hour.");
+        }
+        
+        await using var server = await GetServer(playtest.Id);
+
+        if (server is null)
+        {
+            return new ResetServerResult(false, "No server was found for the playtest.");
+        }
+        
+        var res = await server.ResetSnd(cancellationToken);
+        
+        return new ResetServerResult(res.WasSuccessful, res.WasSuccessful ? "Server was successfully reset." : "Server was not successfully reset.");
+    }
+
+    private async Task<RconClient?> GetServer(string playtestId)
+    {
+        var server = await _servers.Find(server =>
+                server.Reserved &&
+                server.ReservedBy == playtestId)
+            .FirstOrDefaultAsync();
+
+        if (server is null)
+        {
+            return null;
+        }
+
+        var connectionInfo = new RconConnectionInfo(server.Ip, server.Port, _pavlovRconOptions.Password);
+        var clientOptions = new RconClientOptions
+        {
+            CommandTimeout = TimeSpan.FromSeconds(_pavlovRconOptions.CommandTimeoutSeconds)
+        };
+
+        return new RconClient(connectionInfo, clientOptions);
     }
 
     private static (IReadOnlyList<BalancedPlayer> TeamOne, IReadOnlyList<BalancedPlayer> TeamTwo) FindBestSplit(IReadOnlyList<BalancedPlayer> players)
     {
         var totalMmr = players.Sum(static player => player.Mmr);
-        var target = totalMmr / 2d;
+        var target = totalMmr / 2;
 
         List<BalancedPlayer>? bestTeamOne = null;
         var bestMask = 0;
-        var bestDifference = double.MaxValue;
+        var bestDifference = decimal.MaxValue;
 
         var combinationLimit = 1 << players.Count;
         for (var mask = 0; mask < combinationLimit; mask++)
@@ -162,7 +226,7 @@ public sealed class MapTestService : IMapTestService
             }
 
             var teamOne = new List<BalancedPlayer>(capacity: players.Count / 2);
-            var teamOneMmr = 0;
+            decimal teamOneMmr = 0;
 
             for (var index = 0; index < players.Count; index++)
             {

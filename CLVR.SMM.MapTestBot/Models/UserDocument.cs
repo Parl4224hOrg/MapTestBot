@@ -3,6 +3,7 @@ using MongoDB.Bson.Serialization.Attributes;
 
 namespace CLVR.SMM.MapTestBot.Models;
 
+[BsonIgnoreExtraElements]
 public sealed class UserDocument
 {
     [BsonId]
@@ -15,6 +16,9 @@ public sealed class UserDocument
 
     [BsonElement("name")]
     public string Name { get; init; } = string.Empty;
+    
+    [BsonElement("oculusName")]
+    public string OculusName { get; init; } = string.Empty;
 
     [BsonElement("stats")]
     public IReadOnlyList<ObjectId> Stats { get; init; } = [];
